@@ -74,7 +74,7 @@ def test_migration_retains_existing_subject_and_persists_new_records(client, eng
         assert connection.execute(
             text("SELECT code FROM subjects WHERE id = :id"), {"id": subject["id"]}
         ).scalar_one() == subject["code"]
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0003_study_tracking"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_personal_schedule"
 
 
 def test_activity_crud_and_relationship(client, activity):
@@ -499,3 +499,140 @@ def test_estimate_without_available_slots_is_kept_without_reserving(client, part
     assert all(item["suggested_minutes"] for item in saved["coverage"])
     assert client.get(f"/plans/{saved['id']}").json() == saved
     assert client.post(f"/plans/{saved['id']}/approve").status_code == 409
+
+def personal_for(payload, *, start="17:00", end="18:00", title="Transporte"):
+    reference = datetime.fromisoformat(payload["availability"][0]["start"]).astimezone(ZoneInfo("America/Bogota"))
+    return {"title": title, "day": reference.date().isoformat(), "start_time": start,
+            "end_time": end, "description": "Viaje a casa", "category": "Transporte"}
+
+
+def test_personal_crud_and_weekly_occurrences(client):
+    block = {"title": "Trabajo", "day": "2026-11-23", "start_time": "17:00", "end_time": "18:00",
+             "weekdays": [0, 2], "until": "2026-12-02", "description": "Turno"}
+    created = client.post("/personal-blocks", json=block)
+    assert created.status_code == 201, created.text
+    saved = created.json()
+    path = f"/personal-blocks/{saved['id']}"
+    assert client.get(path).json() == saved
+    assert client.get("/personal-blocks").json() == [saved]
+    query = "/personal-blocks/occurrences?start=2026-11-25&end=2026-12-03"
+    dates = [item["start"] for item in client.get(query).json()]
+    assert dates == ["2026-11-25T17:00:00-05:00", "2026-11-30T17:00:00-05:00", "2026-12-02T17:00:00-05:00"]
+    assert client.put(path, json={**block, "end_time": "16:50"}).status_code == 422
+    assert client.put(path, json={**block, "weekdays": [2, 2]}).status_code == 422
+    updated = client.put(path, json={**block, "weekdays": [2], "title": "Clases particulares"})
+    assert updated.status_code == 200 and updated.json()["title"] == "Clases particulares"
+    assert len(client.get(query).json()) == 2
+    assert client.delete(path).status_code == 204
+    assert client.get(path).status_code == 404
+    assert client.get(query).json() == []
+
+
+def calendar_case(activity):
+    payload = plan_payload(activity)
+    zone = ZoneInfo("America/Bogota")
+    start = datetime.fromisoformat(payload["availability"][0]["start"]).astimezone(zone).replace(hour=16)
+    end = start.replace(hour=20)
+    return {**payload, "availability": [{"start": start.isoformat(), "end": end.isoformat()}], "busy": []}
+
+
+def test_generation_avoids_personal_and_protects_approved_sessions(client, activity):
+    payload = calendar_case(activity)
+    commitment = personal_for(payload)
+    block = client.post("/personal-blocks", json=commitment)
+    assert block.status_code == 201, block.text
+    result = client.post("/plans", json=payload)
+    assert result.status_code == 201, result.text
+    plan = result.json()
+    zone = ZoneInfo("America/Bogota")
+    cutoff = datetime.fromisoformat(commitment["day"] + "T17:00").replace(tzinfo=zone)
+    upper = cutoff + timedelta(hours=1)
+    assert all(not (datetime.fromisoformat(session["start"]) < upper and cutoff < datetime.fromisoformat(session["end"]))
+               for session in plan["sessions"])
+    assert any(datetime.fromisoformat(session["start"]) >= upper for session in plan["sessions"])
+    approved = client.post(f"/plans/{plan['id']}/approve")
+    assert approved.status_code == 200, approved.text
+    assert all(item["status"] == "scheduled" for item in approved.json()["sessions"])
+    collision = client.put(f"/personal-blocks/{block.json()['id']}",
+                           json={**commitment, "start_time": "16:00", "end_time": "17:00"})
+    assert collision.status_code == 409 and "Una alternativa" in collision.json()["detail"]
+    assert client.get(f"/plans/{plan['id']}").json() == approved.json()
+    assert client.get(f"/personal-blocks/{block.json()['id']}").json() == block.json()
+
+
+def test_approval_revalidates_personal_blocks_created_after_draft(client, activity):
+    payload = calendar_case(activity)
+    plan = client.post("/plans", json=payload).json()
+    block = client.post("/personal-blocks", json=personal_for(payload, start="16:00", end="16:30"))
+    assert block.status_code == 201, block.text
+    result = client.post(f"/plans/{plan['id']}/approve")
+    assert result.status_code == 409 and "compromiso personal" in result.json()["detail"]
+    assert client.get(f"/plans/{plan['id']}").json()["status"] == "draft"
+    assert client.delete(f"/personal-blocks/{block.json()['id']}").status_code == 204
+    assert client.post(f"/plans/{plan['id']}/approve").status_code == 200
+
+
+def test_generation_replay_and_regeneration_lineage(client, activity):
+    payload = plan_payload(activity)
+    headers = {"X-Plan-Progress": str(uuid4())}
+    first = client.post("/plans", json=payload, headers=headers)
+    second = client.post("/plans", json=payload, headers=headers)
+    assert first.status_code == 201 and second.status_code == 200
+    assert first.json() == second.json()
+    assert len(client.get("/plans").json()) == 1
+    assert client.post("/plans", json={**payload, "max_session_minutes": 45}, headers=headers).status_code == 409
+    derived = client.post("/plans", json={**payload, "derived_from_plan_id": first.json()["id"]})
+    assert derived.status_code == 201, derived.text
+    history = client.get("/plans").json()
+    assert [item["id"] for item in history] == [derived.json()["id"], first.json()["id"]]
+    assert history[0]["derived_from_plan_id"] == history[1]["id"]
+    assert history[0]["replaces_plan_id"] is None
+
+
+@pytest.mark.skipif(os.getenv("STUDYFLOW_TEST_POSTGRES") != "1", reason="Requires PostgreSQL locking")
+def test_personal_create_and_plan_approval_serialize(client, activity):
+    from concurrent.futures import ThreadPoolExecutor
+
+    payload = calendar_case(activity)
+    plan = client.post("/plans", json=payload).json()
+    block = personal_for(payload, start="16:00", end="16:30")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        personal = executor.submit(client.post, "/personal-blocks", json=block)
+        approval = executor.submit(client.post, f"/plans/{plan['id']}/approve")
+        codes = (personal.result().status_code, approval.result().status_code)
+    assert codes in {(201, 409), (409, 200)}
+
+@pytest.mark.skipif(os.getenv("STUDYFLOW_TEST_POSTGRES") != "1", reason="Requires concurrent PostgreSQL sessions")
+def test_same_generation_repeated_concurrently_creates_only_one_plan(client, activity):
+    from concurrent.futures import ThreadPoolExecutor
+
+    payload = plan_payload(activity)
+    headers = {"X-Plan-Progress": str(uuid4())}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(client.post, "/plans", json=payload, headers=headers) for _ in range(2)]
+        statuses = sorted(future.result().status_code for future in futures)
+    assert statuses in ([200, 201], [201, 409])
+    saved = client.get("/plans").json()
+    assert len(saved) == 1
+    replay = client.post("/plans", json=payload, headers=headers)
+    assert replay.status_code == 200 and replay.json()["id"] == saved[0]["id"]
+
+
+def test_agent_receives_only_free_minutes_after_personal_commitments(client, partial_three, monkeypatch):
+    commitment = client.post("/personal-blocks", json={
+        "title": "Transporte", "day": "2026-11-26", "start_time": "17:15", "end_time": "17:30"
+    })
+    assert commitment.status_code == 201, commitment.text
+
+    class ObservedModel(ScriptedModel):
+        def invoke(self, messages):
+            context = json.loads(messages[-1][1])
+            assert context["available_minutes"] == 45
+            return next(self.responses)
+
+    monkeypatch.setattr(workflow, "ollama_model", lambda: ObservedModel([OBJECTIVES]))
+    result = client.post("/plans", json=partial_three)
+    assert result.status_code == 201, result.text
+    plan = result.json()
+    assert plan["mode"] == "agent" and plan["planned_minutes"] == 45
+    assert any("compromisos personales ocuparon 15" in reason for reason in plan["reasons"])

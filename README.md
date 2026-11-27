@@ -26,19 +26,20 @@ Para iniciar el modo determinista mientras se descarga Ollama, ejecuta `docker c
 
 ## Probar el flujo
 
-1. En **Mis materias**, crea o abre una materia y registra una actividad. Agrega filas con cada tema, su prioridad y, si lo conoces, su nivel de dominio. Las horas estimadas se pueden omitir.
-2. Pulsa **Generar plan** dentro de una actividad. Elige días y horario diario. Marca los bloques ocupados en la cuadrícula y selecciona **Agente con Ollama** o **Planificador sin IA**.
-3. Revisa los objetivos, las estimaciones por tema y las sesiones agrupadas por día. Puedes aceptar el borrador o pulsar **Modificar o regenerar** para ajustar el esfuerzo sugerido.
-4. Consulta **Planes de estudio** dentro de la materia para recuperar el historial. En **Mi calendario**, alterna día, semana y mes. Selecciona un evento para abrir sus detalles.
-5. En un plan aprobado o desde una sesión del calendario, registra minutos efectivos y consulta el historial de seguimiento. Pulsa **Replanificar tiempo restante** para solicitar otro horario o proponer un nuevo plazo. Aceptar el reemplazo actualiza las reservas.
-6. Descarga el archivo `.ics` de un plan aprobado e impórtalo en Google Calendar, Outlook u otra aplicación compatible.
+1. En **Mi disponibilidad**, registra compromisos únicos o semanales, como transporte de 17:00 a 18:00.
+2. En **Mis materias**, crea o abre una materia y registra una actividad. Agrega filas con cada tema, su prioridad y, si lo conoces, su nivel de dominio. Las horas estimadas se pueden omitir.
+3. Pulsa **Generar plan** dentro de una actividad. Elige días y horario diario. Marca los bloques ocupados en la cuadrícula y selecciona **Agente con Ollama** o **Planificador sin IA**.
+4. Revisa los objetivos, las estimaciones por tema y las sesiones agrupadas por día. Puedes aceptar el borrador o pulsar **Modificar o regenerar** para ajustar el esfuerzo sugerido.
+5. Consulta **Planes de estudio** dentro de la materia para recuperar el historial. En **Mi calendario**, alterna día, semana y mes. Selecciona un evento para abrir sus detalles.
+6. En un plan aprobado o desde una sesión del calendario, registra minutos efectivos y consulta el historial de seguimiento. Pulsa **Replanificar tiempo restante** para solicitar otro horario o proponer un nuevo plazo. Aceptar el reemplazo actualiza las reservas.
+7. Descarga el archivo `.ics` de un plan aprobado e impórtalo en Google Calendar, Outlook u otra aplicación compatible.
 
 ```powershell
 docker compose logs -f backend
 docker compose restart backend frontend
 ```
 
-Los registros de ejecuciones agénticas incluyen el identificador de ejecución, la actividad y los pasos realmente ejecutados, su duración y su resultado. Las migraciones `0002_plan_history` y `0003_study_tracking` añaden cobertura, plazos de día completo, temas estructurados, estimaciones y seguimiento. Los identificadores de temas se conservan al editarlos en la tabla. En el historial anterior, una fecha o cuota que no se haya registrado se muestra como desconocida. Los cambios se conservan al reiniciar. Los horarios externos se indican como bloques ocupados y la exportación se realiza mediante importación manual del archivo.
+Los registros de ejecuciones agénticas incluyen el identificador de ejecución, la actividad y los pasos realmente ejecutados, su duración y su resultado. Las migraciones `0002_plan_history` y `0003_study_tracking` añaden cobertura, plazos de día completo, temas estructurados, estimaciones y seguimiento. La revisión `0004_personal_schedule` añade los compromisos personales, la relación entre regeneraciones y el identificador persistente de generación. Los identificadores de temas se conservan al editarlos en la tabla. En el historial anterior, una fecha o cuota que no se haya registrado se muestra como desconocida. Los cambios se conservan al reiniciar. Los horarios externos se indican como bloques ocupados y la exportación se realiza mediante importación manual del archivo.
 
 ## Pruebas
 

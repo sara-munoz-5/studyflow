@@ -1,6 +1,7 @@
 from alembic import context
 
 from app.academic.infrastructure import activities, models
+from app.calendar import repository as personal_models
 from app.core.database import Base, engine
 from app.planning.infrastructure import models as planning_models
 

@@ -78,6 +78,24 @@ El grafo admite un reintento para corregir una propuesta inválida y tiene un l�
 
 Los logs emiten un objeto JSON por etapa con identificador de ejecución, identificador de actividad, etapa, duración, resultado y clase de error cuando corresponde. Los datos académicos, las respuestas del modelo y el texto de las excepciones quedan fuera de estos registros.
 
+## Compromisos personales y calendario
+
+La revisión aditiva `0004_personal_schedule` crea `personal_blocks` y añade identidad de solicitud y origen de regeneración a los planes. Los planes anteriores no reciben fechas ni relaciones inferidas.
+
+| Método y ruta | Contrato |
+| --- | --- |
+| `GET /personal-blocks`, `GET /personal-blocks/{id}` | Lista y consulta compromisos. |
+| `POST /personal-blocks`, `PUT /personal-blocks/{id}`, `DELETE /personal-blocks/{id}` | Crea, actualiza y elimina un compromiso o una serie. Una escritura que pisa una reserva devuelve 409 y mantiene la reserva. |
+| `GET /personal-blocks/occurrences?start=YYYY-MM-DD&end=YYYY-MM-DD` | Expande ocurrencias en Bogotá para un rango de días con fin exclusivo, de hasta 366 días. |
+
+Un compromiso guarda `day`, `start_time`, `end_time`, título, categoría y descripción opcionales, y `weekdays` con lunes igual a 0 y domingo igual a 6. Una lista vacía identifica un bloque único. Una lista con días identifica una recurrencia semanal desde `day` hasta `until` inclusive, o indefinida si se omite ese fin. PostgreSQL guarda una fila por serie. La expansión usa el intervalo solicitado y devuelve los extremos con offset.
+
+El planificador convierte las ocurrencias pertinentes a UTC y las combina con los bloqueos manuales y las reservas aprobadas. La generación final y la aprobación consultan compromisos vigentes bajo el mismo bloqueo transaccional que protege la creación, edición y eliminación de compromisos. Ante un cruce, la API explica la reserva y propone una franja alternativa cuando encuentra una el mismo día. Las sesiones aprobadas se conservan.
+
+El calendario usa un selector de vista y fecha de Streamlit para consultar exactamente las ocurrencias que muestra FullCalendar. El componente recibe la hora civil de Bogotá de forma explícita, con independencia de la zona del navegador. Filtrar materias afecta actividades y sesiones. Los compromisos personales tienen su propio filtro. Aceptar un borrador enfoca la siguiente sesión y deja disponible una acción directa hacia el calendario.
+
+`POST /plans` conserva la cabecera opcional `X-Plan-Progress` y la usa también como identidad de la generación. Repetir la misma solicitud con una identidad guardada devuelve el plan existente y 200. Cambiar los parámetros con esa identidad o repetirla durante una generación activa devuelve 409. PostgreSQL protege la unicidad incluso entre procesos. `derived_from_plan_id` registra una regeneración. `replaces_plan_id` conserva el significado de reemplazo de reservas al aprobar.
+
 ## Configuración
 
 | Variable | Uso |

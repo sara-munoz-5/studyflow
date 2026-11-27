@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from app.academic.application.activities import ActivityService
 from app.academic.domain.entities import AcademicActivity, ActivityStatus, Subject
 from app.core.telemetry import PlanTrace
+from app.calendar.application import personal_windows
+from app.calendar.domain import PersonalRepository
 
 from ..domain.entities import StudyPlan, TopicCoverage, Window
 from ..domain.repositories import PlanRepository
@@ -31,13 +33,14 @@ class PlanNotFound(Exception):
     pass
 
 
-def explain_shortage(availability, busy, reserved, now, deadline) -> list[str]:
+def explain_shortage(availability, busy, reserved, now, deadline, personal=()) -> list[str]:
     def minutes(windows):
         return sum(int((window.end - window.start).total_seconds() // 60) for window in windows)
 
     before = minutes(free_slots(availability, [], now, deadline))
     after_manual = minutes(free_slots(availability, busy, now, deadline))
-    free = minutes(free_slots(availability, busy + reserved, now, deadline))
+    after_personal = minutes(free_slots(availability, [*busy, *personal], now, deadline))
+    free = minutes(free_slots(availability, [*busy, *personal, *reserved], now, deadline))
     reasons = [f"Quedaron {free} minutos libres dentro del horario seleccionado antes del plazo."]
     if any(window.end > deadline for window in merge(availability)):
         reasons.append("El plazo de la actividad recortó el horario seleccionado.")
@@ -45,8 +48,10 @@ def explain_shortage(availability, busy, reserved, now, deadline) -> list[str]:
         reasons.append("Se excluyó el tiempo que ya había transcurrido.")
     if before > after_manual:
         reasons.append(f"Los bloques ocupados quitaron {before - after_manual} minutos.")
-    if after_manual > free:
-        reasons.append(f"Las sesiones de planes aprobados reservaron {after_manual - free} minutos adicionales.")
+    if after_manual > after_personal:
+        reasons.append(f"Los compromisos personales ocuparon {after_manual - after_personal} minutos adicionales.")
+    if after_personal > free:
+        reasons.append(f"Las sesiones de planes aprobados reservaron {after_personal - free} minutos adicionales.")
     return reasons
 
 
@@ -78,9 +83,27 @@ def remaining_quotas(source: StudyPlan, activity: AcademicActivity, objectives: 
 
 
 class PlanService:
-    def __init__(self, repository: PlanRepository, activities: ActivityService):
+    def __init__(self, repository: PlanRepository, activities: ActivityService,
+                 personal: PersonalRepository | None = None):
         self.repository = repository
         self.activities = activities
+        self.personal = personal
+
+    def personal_busy(self, availability: list[Window], now: datetime, deadline: datetime) -> list[Window]:
+        if self.personal is None:
+            return []
+        scopes = [Window(max(now, item.start), min(deadline, item.end)) for item in merge(availability)
+                  if max(now, item.start) < min(deadline, item.end)]
+        return personal_windows(self.personal, scopes)
+
+    def replay(self, request_identity: tuple[str, str] | None) -> StudyPlan | None:
+        if request_identity is None:
+            return None
+        key, signature = request_identity
+        previous = self.repository.get_by_request(key)
+        if previous and previous.request_signature != signature:
+            raise PlanConflict("La misma solicitud de generación ya se usó con otros parámetros")
+        return previous
 
     def get(self, plan_id: int) -> StudyPlan:
         plan = self.repository.get(plan_id)
@@ -101,11 +124,16 @@ class PlanService:
         busy: list[Window], limit: int, mode: str,
         agent: PlanningAgent, observer: Callable[[dict], None] | None = None,
         target_minutes: int | None = None, replaces_plan_id: int | None = None,
-        proposed_due_date: datetime | None = None,
+        proposed_due_date: datetime | None = None, derived_from_plan_id: int | None = None,
+        request_identity: tuple[str, str] | None = None,
     ) -> StudyPlan:
+        if existing := self.replay(request_identity):
+            return existing
         activity = self.activities.get_by_id(activity_id)
         if activity.status != ActivityStatus.PENDING:
             raise PlanConflict("La actividad debe estar pendiente")
+        if derived_from_plan_id and self.get(derived_from_plan_id).activity_id != activity_id:
+            raise PlanConflict("El borrador de origen debe pertenecer a la misma actividad")
         source = self._replacement(replaces_plan_id, activity_id)
         version = version_of(source, activity) if source else None
         if proposed_due_date is not None and source is None:
@@ -128,7 +156,9 @@ class PlanService:
 
             def load_slots():
                 now = datetime.now(timezone.utc)
-                return free_slots(availability, busy + self.repository.busy(now, replaces_plan_id), now, effective.due_date)
+                occupied = self.personal_busy(availability, now, effective.due_date)
+                return free_slots(availability, busy + occupied + self.repository.busy(now, replaces_plan_id),
+                                  now, effective.due_date)
 
             with trace.step("run_agent"):
                 # A replacement reuses historical effort and asks the model for study objectives only.
@@ -168,6 +198,8 @@ class PlanService:
 
         # Recheck after inference in case time elapsed or another request approved a plan.
         with self.repository.serialized():
+            if existing := self.replay(request_identity):
+                return existing
             with trace.step("validate_before_save", mode=mode) as result:
                 current = self.activities.get_by_id(activity_id)
                 if current != activity:
@@ -183,14 +215,15 @@ class PlanService:
                     Window(review_start, window.end) if window.start < next_second else window
                     for window in availability if window.start >= next_second or window.end > review_start
                 ]
-                slots = free_slots(review_windows, busy + reserved, next_second, effective.due_date)
+                personal = self.personal_busy(review_windows, next_second, effective.due_date)
+                slots = free_slots(review_windows, busy + personal + reserved, next_second, effective.due_date)
                 sessions = allocate(effective, slots, limit, objectives, weights, quotas)
                 errors = violations(sessions, slots, effective, limit)
                 result.update(session_count=len(sessions), violation_count=len(errors))
                 if errors:
                     raise PlanConflict("; ".join(errors))
             missing = max(0, sum(quotas.values()) - sum(item.duration_minutes for item in sessions))
-            reasons = explain_shortage(review_windows, busy, reserved, next_second, effective.due_date) if missing else []
+            reasons = explain_shortage(review_windows, busy, reserved, next_second, effective.due_date, personal) if missing else []
             if missing and any(window.end <= next_second for window in availability):
                 reasons.append("Algunas ventanas seleccionadas ya habían terminado.")
             if missing and any(window.start < next_second < window.end for window in availability):
@@ -210,7 +243,9 @@ class PlanService:
                              sessions, missing, reasons, tools_used=tools, created_at=now, coverage=coverage,
                              estimate_source=estimate_source, assumptions=assumptions,
                              replaces_plan_id=replaces_plan_id, replacement_version=version,
-                             proposed_due_date=proposed_due_date)
+                             proposed_due_date=proposed_due_date, derived_from_plan_id=derived_from_plan_id,
+                             request_id=request_identity[0] if request_identity else None,
+                             request_signature=request_identity[1] if request_identity else None)
             with trace.step("save_plan") as result:
                 if not sessions:
                     plan.status = "unavailable"
@@ -262,8 +297,13 @@ class PlanService:
             now = datetime.now(timezone.utc)
             deadline = plan.proposed_due_date or activity.due_date
             effective = replace(activity, due_date=deadline)
-            slots = free_slots(plan.availability, plan.busy + self.repository.busy(now, plan.replaces_plan_id), now, deadline)
+            personal = self.personal_busy(plan.availability, now, deadline)
+            reserved = self.repository.busy(now, plan.replaces_plan_id)
+            slots = free_slots(plan.availability, plan.busy + personal + reserved, now, deadline)
             errors = violations(plan.sessions, slots, effective, plan.max_session_minutes)
+            if any(session.start < item.end and item.start < session.end
+                   for session in plan.sessions for item in personal):
+                errors.insert(0, "Una sesión coincide con un compromiso personal vigente. Modifica o regenera el plan")
             if any(session.start < now for session in plan.sessions):
                 errors.insert(0, "Una sesión del borrador ya empezó. Usa Modificar o regenerar para actualizar sus horarios")
             if plan.proposed_due_date and any(

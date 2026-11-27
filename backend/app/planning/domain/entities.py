@@ -72,6 +72,9 @@ class StudyPlan:
     replaces_plan_id: int | None = None
     replacement_version: str | None = None
     proposed_due_date: datetime | None = None
+    derived_from_plan_id: int | None = None
+    request_id: str | None = None
+    request_signature: str | None = None
 
     @property
     def completed_minutes(self) -> int:

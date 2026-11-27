@@ -4,7 +4,7 @@ from pathlib import Path
 import httpx
 from streamlit.testing.v1 import AppTest
 
-from calendar_view import PALETTE, ZONE, block_rows, calendar_entries, pack_windows
+from calendar_view import PALETTE, ZONE, block_rows, calendar_entries, calendar_range, pack_windows
 
 
 SUBJECT = {"id": 1, "name": "Arquitectura de software", "code": "ARQ", "description": "Diseño de sistemas"}
@@ -114,6 +114,8 @@ def test_visual_availability_to_draft_and_approval(monkeypatch):
             return httpx.Response(200, json=saved[0])
         if path.startswith("/plans/progress/"):
             return httpx.Response(200, json={"events": []})
+        if path == "/personal-blocks/occurrences":
+            return httpx.Response(200, json=[])
         return httpx.Response(200, json={"/subjects": [SUBJECT], "/activities": [pending], "/plans": saved}[path])
 
     monkeypatch.setattr(httpx, "request", request)
@@ -148,3 +150,18 @@ def test_calendar_keeps_completed_history_without_replaced_slots():
     events, _ = calendar_entries([SUBJECT], [activity()], [original, plan("draft")])
     assert {item["id"] for item in events} == {"activity-3", "session-5"}
     assert events[1]["title"].endswith("Completada")
+
+def test_personal_events_stay_visible_with_academic_filter_and_use_bogota_clock():
+    personal = [{"block_id": 8, "title": "Transporte", "start": "2026-11-26T22:00:00Z",
+                 "end": "2026-11-26T23:00:00Z", "category": None, "description": "Viaje"}]
+    events, by_id = calendar_entries([SUBJECT], [], [], personal)
+    assert len(events) == 1
+    event = events[0]
+    assert event["title"] == "Personal · Transporte"
+    assert event["start"] == "2026-11-26T17:00:00" and event["end"] == "2026-11-26T18:00:00"
+    assert event["backgroundColor"] not in {color for palette in PALETTE.values() for color in palette}
+    assert by_id[event["id"]]["personal"]["description"] == "Viaje"
+    anchor = datetime(2026, 11, 26).date()
+    for view in ("Día", "Semana", "Mes"):
+        start, end = calendar_range(anchor, view)
+        assert start <= anchor < end

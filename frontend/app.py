@@ -1,15 +1,16 @@
 import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time, timedelta
-from uuid import uuid4
+from datetime import date, datetime, time, timedelta
+from uuid import UUID, uuid4
 
 import httpx
 import pandas as pd
 import streamlit as st
 from streamlit_calendar import calendar
 
-from calendar_view import KINDS, ZONE, block_rows, calendar_entries, day_label, intersects, local, pack_windows
+from calendar_view import (KINDS, MONTHS, VIEWS, WEEKDAYS, ZONE, block_rows, calendar_entries,
+                           calendar_range, day_label, intersects, local, pack_windows, shift_view)
 
 API = os.getenv("STUDYFLOW_API_URL", "http://127.0.0.1:8001")
 STATUS = {"pending": "Pendiente", "completed": "Completada", "cancelled": "Cancelada"}
@@ -236,7 +237,10 @@ def start_config(activity_id, previous=None):
 
 def show_plan(plan, subject, activity):
     st.subheader(activity["title"])
-    st.caption(f"{PLAN_STATUS[plan['status']]} · {MODES[plan['mode']]}")
+    identifier = f"Plan #{plan['id']} · " if plan['id'] is not None else ""
+    st.caption(f"{identifier}{PLAN_STATUS[plan['status']]} · {MODES[plan['mode']]} · {subject['name']}")
+    if plan.get('derived_from_plan_id'):
+        st.caption(f"Regenerado desde el plan #{plan['derived_from_plan_id']}")
     planned, required = plan["planned_minutes"], plan["required_minutes"]
     coverage = plan["coverage"]
     percent = planned / required if required else 0
@@ -258,13 +262,16 @@ def show_plan(plan, subject, activity):
     if plan["status"] == "draft":
         left, right = st.columns(2)
         if left.button("Aceptar plan", type="primary", width="stretch"):
-            if request("POST", f"/plans/{plan['id']}/approve"):
-                navigate(notice="Plan aprobado. Sus sesiones ya aparecen en Mi calendario.")
+            approved = request("POST", f"/plans/{plan['id']}/approve")
+            if approved:
+                navigate(notice="Plan aprobado. Sus sesiones ya aparecen en Mi calendario.",
+                         calendar_anchor=calendar_date(approved))
         if right.button("Modificar o regenerar", width="stretch"):
             start_config(activity["id"], plan)
     elif plan["status"] == "unavailable" and st.button("Modificar disponibilidad", type="primary"):
         start_config(activity["id"], plan)
     if plan["status"] == "approved":
+        st.button("Ver sesiones en Mi calendario", on_click=open_calendar, args=(calendar_date(plan),))
         if st.button("Replanificar tiempo restante", type="primary"):
             start_config(activity["id"], plan)
         export_button(plan["id"], f"plan-{plan['id']}")
@@ -386,6 +393,10 @@ def availability_form(activity, plans):
     availability = [(datetime.combine(period[0] + timedelta(days=i), start, ZONE),
                      datetime.combine(period[0] + timedelta(days=i), end, ZONE))
                     for i in range((period[1] - period[0]).days + 1)]
+    personal = request("GET", f"/personal-blocks/occurrences?start={period[0]}&end={period[1] + timedelta(days=1)}")
+    if personal is None:
+        return
+    personal_slots = [(local(item["start"]), local(item["end"])) for item in personal]
     reserved = [(local(session["start"]), local(session["end"])) for plan in plans if plan["status"] == "approved"
                 for session in plan["sessions"]
                 if plan["id"] != source_id or session.get("study_status") == "completed"]
@@ -395,7 +406,7 @@ def availability_form(activity, plans):
                                      if any(intersects(*slot, *busy) for busy in original)}
         st.session_state.occupied_initialized = True
 
-    st.caption("□ Libre · ☑ Ocupado por ti · 🔒 Incluye una sesión aprobada · — Fuera de plazo")
+    st.caption("□ Libre · ☑ Bloque manual · 🔒 Sesión aprobada · ◆ Compromiso personal · — Fuera de plazo")
     if st.button("Limpiar selección"):
         for key in list(st.session_state):
             if key.startswith(f"cell-{config}-"):
@@ -414,9 +425,10 @@ def availability_form(activity, plans):
         columns[0].caption(f"{slots[0][0]:%H:%M}–{slots[0][1]:%H:%M}")
         for column, slot in zip(columns[1:], slots):
             blocked = any(intersects(*slot, *item) for item in reserved)
+            personal_blocked = any(intersects(*slot, *item) for item in personal_slots)
             expired = slot[1] <= now or slot[0] >= deadline
-            if blocked or expired:
-                column.write("🔒" if blocked else "—")
+            if blocked or personal_blocked or expired:
+                column.write("🔒" if blocked else "◆" if personal_blocked else "—")
                 continue
             checked = column.checkbox(f"{slot[0]:%d/%m %H:%M}", value=slot in st.session_state.occupied,
                                       key=f"cell-{config}-{slot[0].isoformat()}-{slot[1].isoformat()}",
@@ -431,10 +443,11 @@ def availability_form(activity, plans):
         manual = pack_windows(slot for slot in st.session_state.occupied if any(
             left <= slot[0] < slot[1] <= right for left, right in availability
         ))
-        job_id = str(uuid4())
+        job_id = str(UUID(hex=config))
         payload = {"activity_id": activity["id"], "timezone": ZONE.key, "mode": mode,
                    "availability": pack_windows(availability), "busy": manual, "max_session_minutes": limit,
-                   "target_minutes": target_minutes, "replaces_plan_id": source_id, "proposed_due_date": proposed_due_date}
+                   "target_minutes": target_minutes, "replaces_plan_id": source_id, "proposed_due_date": proposed_due_date,
+                   "derived_from_plan_id": previous.get("id") if previous.get("status") in {"draft", "unavailable"} else None}
         future = generator_pool().submit(fetch, "POST", "/plans", payload, {"X-Plan-Progress": job_id})
         navigate(job={"id": job_id, "future": future}, previous={**previous, **payload})
 
@@ -487,10 +500,15 @@ def subject_detail(subject, records, plans):
             st.info("Los borradores y planes aprobados aparecerán aquí.")
         for plan in history:
             with st.container(border=True):
-                st.subheader(activities[plan["activity_id"]]["title"])
+                st.subheader(f"Plan #{plan['id']} · {activities[plan['activity_id']]['title']}")
                 created = local(plan["created_at"]).strftime("%d/%m/%Y %H:%M") if plan["created_at"] else "Fecha sin registrar"
-                st.caption(f"{PLAN_STATUS[plan['status']]} · {created}")
-                st.write(f"{plan['planned_minutes']} min planificados · {plan['missing_minutes']} min pendientes")
+                st.caption(f"{subject['name']} · {PLAN_STATUS[plan['status']]} · {created}")
+                st.write(f"{len(plan['sessions'])} sesiones · {plan['planned_minutes']} min planificados · "
+                         f"{plan['missing_minutes']} min pendientes")
+                if plan.get("replaces_plan_id"):
+                    st.caption(f"Reemplazo del plan #{plan['replaces_plan_id']}")
+                if plan.get("derived_from_plan_id"):
+                    st.caption(f"Regenerado desde el plan #{plan['derived_from_plan_id']}")
                 if st.button("Abrir plan", key=f"plan-{plan['id']}"):
                     navigate(action="show_plan", selected_plan=plan["id"], transient=None)
         return
@@ -528,35 +546,163 @@ def subject_detail(subject, records, plans):
                 navigate(action="delete_activity", activity_id=key)
 
 
+def calendar_date(plan):
+    starts = sorted(local(item["start"]) for item in plan["sessions"])
+    now = datetime.now(ZONE)
+    return next((start for start in starts if start >= now), starts[-1] if starts else now).date()
+
+
+def open_calendar(day):
+    st.session_state.update(navigation="Mi calendario", calendar_anchor=day)
+
+
+def open_personal(identifier=None):
+    st.session_state.update(navigation="Mi disponibilidad", personal_action="edit", personal_edit=identifier)
+
+
+def personal_page():
+    st.title("Mi disponibilidad")
+    st.caption("Los compromisos personales ocupan tiempo en America/Bogota para todas las materias.")
+    action = st.session_state.get("personal_action")
+    identifier = st.session_state.get("personal_edit")
+    if action:
+        if st.button("← Volver a compromisos"):
+            navigate(personal_action=None, personal_edit=None)
+        record = request("GET", f"/personal-blocks/{identifier}") if identifier else {}
+        if record is None:
+            return
+        if action == "delete":
+            st.subheader(f"Eliminar {record['title']}")
+            st.write("Se libera el horario del compromiso y de sus repeticiones.")
+            if st.checkbox("Confirmar eliminación") and st.button("Eliminar compromiso", type="primary"):
+                if request("DELETE", f"/personal-blocks/{identifier}"):
+                    navigate(personal_action=None, personal_edit=None, notice="Compromiso eliminado.")
+            return
+        edit_personal(record)
+        return
+
+    if st.button("Crear compromiso", type="primary"):
+        navigate(personal_action="edit", personal_edit=None)
+    records = request("GET", "/personal-blocks")
+    if records == []:
+        st.info("Agrega trabajo, transporte u otros horarios que quieres mantener libres de estudio.")
+    for record in records or []:
+        with st.container(border=True):
+            st.subheader(record["title"])
+            label = day_label(date.fromisoformat(record["day"]))
+            if record["weekdays"]:
+                label = ", ".join(WEEKDAYS[index].capitalize() for index in record["weekdays"]) + f" · Desde {label}"
+                if record["until"]:
+                    label += f" · Hasta {day_label(date.fromisoformat(record['until']))}"
+            st.caption(f"{label} · {record['start_time'][:5]}–{record['end_time'][:5]}")
+            if record["category"]:
+                st.write(record["category"])
+            if record["description"]:
+                st.write(record["description"])
+            left, right = st.columns(2)
+            if left.button("Editar compromiso", key=f"edit-personal-{record['id']}"):
+                navigate(personal_action="edit", personal_edit=record["id"])
+            if right.button("Eliminar compromiso", key=f"delete-personal-{record['id']}"):
+                navigate(personal_action="delete", personal_edit=record["id"])
+
+
+def edit_personal(record):
+    key = record.get("id", "new")
+    st.subheader("Editar compromiso" if record else "Nuevo compromiso")
+    repeat = st.checkbox("Repetir semanalmente", value=bool(record.get("weekdays")), key=f"repeat-{key}")
+    limit = repeat and st.checkbox("Definir último día de repetición", value=bool(record.get("until")),
+                                   key=f"limit-personal-{key}")
+    today = datetime.now(ZONE).date()
+    with st.form(f"personal-{key}"):
+        title = st.text_input("Título del compromiso", record.get("title", ""), max_chars=150)
+        day = st.date_input("Fecha del compromiso", date.fromisoformat(record.get("day", today.isoformat())))
+        left, right = st.columns(2)
+        start = left.time_input("Hora de inicio", time.fromisoformat(record.get("start_time", "17:00")))
+        end = right.time_input("Hora de finalización", time.fromisoformat(record.get("end_time", "18:00")))
+        weekdays = st.multiselect("Días de repetición", range(7), default=record.get("weekdays", []),
+                                   format_func=lambda index: WEEKDAYS[index].capitalize()) if repeat else []
+        until = st.date_input("Último día", date.fromisoformat(record.get("until") or day.isoformat())) if limit else None
+        category = st.text_input("Categoría (opcional)", record.get("category") or "", max_chars=50)
+        description = st.text_area("Descripción (opcional)", record.get("description") or "", max_chars=500)
+        if st.form_submit_button("Guardar compromiso", type="primary"):
+            if end <= start or (repeat and not weekdays):
+                st.error("La hora final debe ser posterior a la inicial. Selecciona los días si activaste la repetición.")
+                return
+            save("/personal-blocks", record, {
+                "title": title, "day": day.isoformat(), "start_time": start.isoformat(), "end_time": end.isoformat(),
+                "category": category or None, "description": description or None, "weekdays": weekdays,
+                "until": until.isoformat() if until else None,
+            }, personal_action=None, personal_edit=None)
+
+
 def calendar_page(subjects, activities, plans):
     st.title("Mi calendario")
-    st.caption("America/Bogota · Los bloques Estudio corresponden a sesiones aprobadas.")
+    st.caption("America/Bogota · Los borradores se revisan y aceptan desde Mis materias.")
     filters = st.multiselect("Filtrar materias", [item["id"] for item in subjects],
                              format_func={item["id"]: item["name"] for item in subjects}.get)
     if filters:
         activities = [item for item in activities if item["subject_id"] in filters]
         ids = {item["id"] for item in activities}
         plans = [plan for plan in plans if plan["activity_id"] in ids]
+    show_personal = st.checkbox("Mostrar compromisos personales", value=True)
+    st.button("Crear compromiso personal", on_click=open_personal, width="content")
+    today = datetime.now(ZONE).date()
+    anchor = st.session_state.setdefault("calendar_anchor", today)
+    view = st.segmented_control("Vista del calendario", list(VIEWS), default="Semana",
+                                key="calendar-view") or "Semana"
+    previous, current, following, picker = st.columns([1, 1, 1, 2])
+    if previous.button("← Anterior"):
+        navigate(calendar_anchor=shift_view(anchor, view, -1))
+    if current.button("Hoy"):
+        navigate(calendar_anchor=today)
+    if following.button("Siguiente →"):
+        navigate(calendar_anchor=shift_view(anchor, view, 1))
+    chosen = picker.date_input("Fecha del calendario", anchor, key=f"calendar-date-{anchor}")
+    if chosen != anchor:
+        navigate(calendar_anchor=chosen)
+    start, end = calendar_range(anchor, view)
+    personal = request("GET", f"/personal-blocks/occurrences?start={start}&end={end}") if show_personal else []
     st.markdown(" · ".join(
         f":{color}[{KINDS[key]}]" for key, color in (("exam", "red"), ("assignment", "blue"),
                                                     ("laboratory", "violet"), ("project", "orange"))
-    ))
-    events, details = calendar_entries(subjects, activities, plans)
+    ) + " · Estudio en tono claro · Personal en gris")
+    events, details = calendar_entries(subjects, activities, plans, personal or [])
+    study = sorted(local(item["session"]["start"]) for item in details.values() if item.get("session"))
+    interval = [item for item in study if start <= item.date() < end]
+    if not study:
+        st.info("Todavía no hay sesiones aprobadas para las materias visibles. Abre un borrador en Mis materias y acéptalo.")
+    elif not interval:
+        next_session = next((item for item in study if item.date() >= end), study[-1])
+        if st.button("Ir a una sesión de estudio"):
+            navigate(calendar_anchor=next_session.date())
+    focus = interval[0].hour if interval else 9
+    st.subheader(day_label(anchor) if view == "Día" else
+                 f"{MONTHS[anchor.month - 1].capitalize()} {anchor.year}" if view == "Mes" else
+                 f"{start:%d/%m} – {end - timedelta(days=1):%d/%m}")
     selection = st.container()
     result = calendar(events=events, options={
-        "initialView": "timeGridWeek", "initialDate": datetime.now(ZONE).date().isoformat(),
-        "firstDay": 1, "timeZone": "UTC", "locale": "es", "height": "auto", "scrollTime": "08:00:00",
-        "headerToolbar": {"left": "prev,next today", "center": "title", "right": "timeGridDay,timeGridWeek,dayGridMonth"},
-        "buttonText": {"today": "Hoy", "day": "Día", "week": "Semana", "month": "Mes"},
+        "initialView": VIEWS[view], "initialDate": anchor.isoformat(), "headerToolbar": False,
+        "firstDay": 1, "timeZone": "UTC", "locale": "es", "height": "auto" if view == "Mes" else 660,
+        "scrollTime": f"{max(0, focus - 1):02d}:00:00", "fixedWeekCount": False,
         "eventTimeFormat": {"hour": "2-digit", "minute": "2-digit", "hour12": False},
         "slotLabelFormat": {"hour": "2-digit", "minute": "2-digit", "hour12": False},
-        "slotDuration": "00:30:00", "dayMaxEvents": True, "editable": False,
-    }, callbacks=["eventClick"], custom_css=".fc-event-title { white-space: normal; } .fc .fc-toolbar { flex-wrap: wrap; gap: .6rem; }",
-                      key="study-calendar") or {}
+        "slotDuration": "00:30:00", "dayMaxEvents": False, "editable": False,
+    }, callbacks=["eventClick"], custom_css=".fc-event-title { white-space: normal; }",
+                      key=f"study-calendar-{view}-{anchor}") or {}
     clicked = result.get("eventClick", {}).get("event", {}).get("id")
     if clicked in details and result.get("callback") == "eventClick":
         item = details[clicked]
-        if item["session"]:
+        if commitment := item.get("personal"):
+            first, last = local(commitment["start"]), local(commitment["end"])
+            with selection.container(border=True):
+                st.subheader(commitment["title"])
+                st.caption(f"Personal · {day_label(first.date())} · {first:%H:%M}–{last:%H:%M}")
+                if commitment["category"]:
+                    st.write(commitment["category"])
+                if commitment["description"]:
+                    st.write(commitment["description"])
+                st.button("Editar compromiso desde el calendario", on_click=open_personal, args=(commitment["block_id"],))
+        elif item.get("session"):
             with selection:
                 st.caption(day_label(local(item['session']['start']).date()))
                 show_session(item["session"], item["subject"], item["activity"], item["plan"])
@@ -586,10 +732,13 @@ def main():
     if st.session_state.get("job"):
         generation_progress()
         return
-    page = st.sidebar.radio("Navegación", ["Mis materias", "Mi calendario"], label_visibility="collapsed",
+    page = st.sidebar.radio("Navegación", ["Mis materias", "Mi calendario", "Mi disponibilidad"], label_visibility="collapsed",
                             key="navigation")
     if notice := st.session_state.pop("notice", None):
         st.success(notice)
+    if page == "Mi disponibilidad":
+        personal_page()
+        return
     subjects = request("GET", "/subjects")
     activities = request("GET", "/activities")
     plans = request("GET", "/plans")

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import timezone
 from uuid import UUID
 from typing import Annotated, Literal
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.academic.api.activities import get_activity_service
 from app.agents.workflow import run_agent
+from app.calendar.repository import SQLAlchemyPersonalRepository
 from app.calendar.providers import CalendarExporter, ICalendarExporter
 from app.core.database import get_db
 from app.planning.application.services import PlanService
@@ -45,6 +48,7 @@ class PlanInput(BaseModel):
     mode: Literal["agent", "deterministic"] = "agent"
     target_minutes: int | None = Field(default=None, ge=1, le=12000)
     replaces_plan_id: int | None = Field(default=None, gt=0)
+    derived_from_plan_id: int | None = Field(default=None, gt=0)
     proposed_due_date: AwareDatetime | None = None
 
     @field_validator("timezone")
@@ -111,12 +115,13 @@ class PlanResponse(BaseModel):
     estimate_source: str
     assumptions: list[str]
     replaces_plan_id: int | None
+    derived_from_plan_id: int | None
     proposed_due_date: AwareDatetime | None
     coverage: list[CoverageResponse]
 
 
 def get_service(db: Session = Depends(get_db)) -> PlanService:
-    return PlanService(SQLAlchemyPlanRepository(db), get_activity_service(db))
+    return PlanService(SQLAlchemyPlanRepository(db), get_activity_service(db), SQLAlchemyPersonalRepository(db))
 
 
 def get_exporter() -> CalendarExporter:
@@ -129,12 +134,20 @@ Service = Annotated[PlanService, Depends(get_service)]
 @router.post("", response_model=PlanResponse, status_code=201)
 def generate(data: PlanInput, service: Service, response: Response,
              progress_id: Annotated[UUID | None, Header(alias="X-Plan-Progress")] = None):
+    identity = None
+    if progress_id:
+        signature = hashlib.sha256(json.dumps(data.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
+        identity = str(progress_id), signature
+        if existing := service.replay(identity):
+            response.status_code = 200
+            return existing
     with plan_progress.track(progress_id) as observer:
         plan = service.generate(
             data.activity_id, data.timezone, [item.to_domain() for item in data.availability],
             [item.to_domain() for item in data.busy], data.max_session_minutes, data.mode, run_agent, observer,
             data.target_minutes, data.replaces_plan_id,
             data.proposed_due_date.astimezone(timezone.utc) if data.proposed_due_date else None,
+            data.derived_from_plan_id, identity,
         )
     if plan.status == "unavailable":
         response.status_code = 200

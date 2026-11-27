@@ -1,3 +1,4 @@
+from calendar import Calendar, monthrange
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -36,7 +37,27 @@ def pack_windows(windows):
     return [{"start": start.isoformat(), "end": end.isoformat()} for start, end in merged]
 
 
-def calendar_entries(subjects, activities, plans):
+VIEWS = {"Día": "timeGridDay", "Semana": "timeGridWeek", "Mes": "dayGridMonth"}
+
+
+def calendar_range(day, view):
+    if view == "Día":
+        return day, day + timedelta(days=1)
+    if view == "Semana":
+        first = day - timedelta(days=day.weekday())
+        return first, first + timedelta(days=7)
+    weeks = Calendar(firstweekday=0).monthdatescalendar(day.year, day.month)
+    return weeks[0][0], weeks[-1][-1] + timedelta(days=1)
+
+
+def shift_view(day, view, direction):
+    if view != "Mes":
+        return day + timedelta(days=direction * (7 if view == "Semana" else 1))
+    year, month = divmod(day.year * 12 + day.month - 1 + direction, 12)
+    return day.replace(year=year, month=month + 1, day=min(day.day, monthrange(year, month + 1)[1]))
+
+
+def calendar_entries(subjects, activities, plans, personal=()):
     subjects = {item["id"]: item for item in subjects}
     activities = {item["id"]: item for item in activities}
     events, details = [], {}
@@ -63,7 +84,8 @@ def calendar_entries(subjects, activities, plans):
             continue
         day = activity.get("due_day")
         kind = KINDS[activity["type"]]
-        add(f"activity-{activity['id']}", activity, f"{kind} · {activity['title']}",
+        prefix = f"Plazo de {kind.lower()}" if day else kind
+        add(f"activity-{activity['id']}", activity, f"{prefix} · {activity['title']}",
             day or wall(activity["due_date"]), all_day=bool(day))
 
     for plan in plans:
@@ -77,6 +99,12 @@ def calendar_entries(subjects, activities, plans):
             suffix = {"completed": " · Completada", "partial": " · Parcial", "not_done": " · No realizada"}.get(study, "")
             add(f"session-{session['id']}", activity, f"Estudio · {session['topic']}{suffix}", wall(session["start"]),
                 wall(session["end"]), session=session, plan=plan)
+    for item in personal:
+        event_id = f"personal-{item['block_id']}-{item['start']}"
+        events.append({"id": event_id, "title": f"Personal · {item['title']}", "start": wall(item["start"]),
+                       "end": wall(item["end"]), "allDay": False,
+                       "backgroundColor": "#54677b", "borderColor": "#435568", "textColor": "#ffffff"})
+        details[event_id] = {"personal": item}
     return events, details
 
 

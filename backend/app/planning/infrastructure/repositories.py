@@ -54,6 +54,8 @@ class SQLAlchemyPlanRepository:
             created_at=utc(row.created_at) if row.created_at else None,
             estimate_source=row.estimate_source or "legacy", assumptions=row.assumptions or [],
             replaces_plan_id=row.replaces_plan_id, replacement_version=row.replacement_version,
+            derived_from_plan_id=row.derived_from_plan_id, request_id=row.request_id,
+            request_signature=row.request_signature,
             proposed_due_date=utc(row.proposed_due_date) if row.proposed_due_date else None,
             coverage=[TopicCoverage(**item) for item in (row.coverage or [])],
             sessions=[
@@ -72,6 +74,8 @@ class SQLAlchemyPlanRepository:
             coverage=[asdict(item) for item in plan.coverage], estimate_source=plan.estimate_source,
             assumptions=plan.assumptions, replaces_plan_id=plan.replaces_plan_id,
             replacement_version=plan.replacement_version, proposed_due_date=plan.proposed_due_date,
+            derived_from_plan_id=plan.derived_from_plan_id, request_id=plan.request_id,
+            request_signature=plan.request_signature,
         )
         self.db.add(row)
         try:
@@ -91,6 +95,10 @@ class SQLAlchemyPlanRepository:
 
     def get(self, plan_id: int) -> StudyPlan | None:
         row = self.db.get(PlanModel, plan_id, populate_existing=True)
+        return self._to_domain(row) if row else None
+
+    def get_by_request(self, key: str) -> StudyPlan | None:
+        row = self.db.scalar(select(PlanModel).where(PlanModel.request_id == key))
         return self._to_domain(row) if row else None
 
     def list_all(self) -> list[StudyPlan]:

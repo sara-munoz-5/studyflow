@@ -28,6 +28,9 @@ class PlanModel(Base):
     replaces_plan_id: Mapped[int | None] = mapped_column(ForeignKey("study_plans.id"))
     replacement_version: Mapped[str | None] = mapped_column(String(64))
     proposed_due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    derived_from_plan_id: Mapped[int | None] = mapped_column(ForeignKey("study_plans.id"))
+    request_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
+    request_signature: Mapped[str | None] = mapped_column(String(64))
 
 
 class SessionModel(Base):

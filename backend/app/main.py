@@ -8,6 +8,8 @@ from app.academic.api.router import router as subject_router
 from app.academic.application.activities import ActivityNotFound
 from app.academic.application.services import RelatedRecords, SubjectNotFound
 from app.agents.workflow import AgentFailure, AgentUnavailable
+from app.calendar.api import router as personal_router
+from app.calendar.application import PersonalBlockConflict, PersonalBlockNotFound
 from app.core.database import get_db
 from app.planning.api.router import router as plan_router
 from app.planning.application.services import PlanConflict, PlanNotFound
@@ -21,9 +23,11 @@ app = FastAPI(
 app.include_router(subject_router)
 app.include_router(activity_router)
 app.include_router(plan_router)
+app.include_router(personal_router)
 
 ERROR_STATUS = {
     ActivityNotFound: 404, SubjectNotFound: 404, PlanNotFound: 404,
+    PersonalBlockNotFound: 404, PersonalBlockConflict: 409,
     RelatedRecords: 409, PlanConflict: 409, AgentUnavailable: 503, AgentFailure: 502,
 }
 

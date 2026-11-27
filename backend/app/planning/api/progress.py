@@ -26,7 +26,7 @@ class PlanProgress:
         with self.lock:
             cutoff = monotonic() - 900
             self.runs = {k: v for k, v in self.runs.items() if v.finished is None or v.finished > cutoff}
-            if key in self.runs:
+            if key in self.runs and self.runs[key].finished is None:
                 raise HTTPException(409, "El identificador de progreso ya está en uso")
             if len(self.runs) >= 256:
                 finished = [k for k, v in self.runs.items() if v.finished is not None]
