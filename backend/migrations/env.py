@@ -1,9 +1,10 @@
 from alembic import context
 
-from app.academic.infrastructure import activities, models
-from app.calendar import repository as personal_models
+# Import ORM modules so their tables are registered in Base.metadata.
+from app.academic.infrastructure import activities, models  # noqa: F401
+from app.calendar import repository as personal_models  # noqa: F401
 from app.core.database import Base, engine
-from app.planning.infrastructure import models as planning_models
+from app.planning.infrastructure import models as planning_models  # noqa: F401
 
 
 def migrate_offline():

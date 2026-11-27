@@ -1,4 +1,32 @@
+# Entornos locales y secretos
 .venv/
+.venv-*/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Cachés y registros
 __pycache__/
 *.py[cod]
-.env
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# Bases de datos y modelos locales
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.ollama/
+*.gguf
+*.safetensors
+
+# Grabaciones y archivos multimedia de gran tamaño
+*.mp4
+*.mov
+*.mkv
+*.webm
